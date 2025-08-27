@@ -1,6 +1,6 @@
 """
 World with: resources, pantry, basic & dynamic structures, road-desire learning,
-and a global exploration field that agents try to minimize (novelty seeking).
+a global exploration field, and dynamic effects (food_boost, emit, iq_aura, comms).
 
 Fixed material codes:
   0 empty, 1 food, 2 seed, 3 pantry, 4 tree, 5 fiber, 6 rock, 7 road, 8 cache, 9 beacon
@@ -36,12 +36,12 @@ class World:
         self.pantry: Tuple[int, int] | None = None
         self.caches: Dict[Tuple[int, int], int] = {}
 
-        # learning fields
+        # learning / navigation fields
         self.road_desire = np.zeros((cfg.height, cfg.width), dtype=np.float32)
-        # NEW: exploration heat (higher = well trodden). Agents prefer lower values.
-        self.explore = np.zeros((cfg.height, cfg.width), dtype=np.float32)
+        self.explore     = np.zeros((cfg.height, cfg.width), dtype=np.float32)  # higher = well-trodden
 
         # dynamic structure registry
+        # code -> { name, color, cache?, move_mult?, comms_bonus?, food_boost?, iq_aura?, emit{material->p}, emit_radius? }
         self.struct_defs: Dict[int, Dict[str, Any]] = {}
         self.next_dyn_code: int = 10
 
@@ -80,29 +80,52 @@ class World:
         if self.tick % 6 == 0:
             self.materials[self.materials == 2] = 1
 
-        # learning fields decay slowly
+        # learning/exploration fade
         self.road_desire *= 0.9995
-        self.explore *= 0.9997
+        self.explore     *= 0.9997
 
-        # dynamic structure effects
+        # dynamic structure effects every few ticks
         if self.tick % 10 == 0:
             self._apply_dynamic_effects()
 
     def _apply_dynamic_effects(self) -> None:
-        """Apply effects of invented structures (e.g., food_boost)."""
+        """Apply effects of invented structures:
+           - food_boost: small chance to spawn food in radius 2
+           - emit: spawn specific materials near the structure
+           - iq_aura: handled in agents via iq_aura_at()
+        """
         H, W = self.materials.shape
         for code, props in self.struct_defs.items():
-            fb = float(props.get("food_boost", 0.0))
-            if fb <= 0:
-                continue
             ys, xs = np.where(self.materials == code)
-            for (y, x) in zip(ys, xs):
-                for _ in range(2):
-                    dy, dx = int(self.rng.integers(-2, 3)), int(self.rng.integers(-2, 3))
-                    ny, nx = y + dy, x + dx
-                    if 0 <= ny < H and 0 <= nx < W and self.materials[ny, nx] == 0:
-                        if self.rng.random() < min(0.25, fb):
-                            self.materials[ny, nx] = 1
+            if len(ys) == 0:
+                continue
+
+            # Food boost (garden/grove)
+            fb = float(props.get("food_boost", 0.0))
+            if fb > 0:
+                for (y, x) in zip(ys, xs):
+                    for _ in range(2):
+                        dy, dx = int(self.rng.integers(-2, 3)), int(self.rng.integers(-2, 3))
+                        ny, nx = y + dy, x + dx
+                        if 0 <= ny < H and 0 <= nx < W and self.materials[ny, nx] == 0:
+                            if self.rng.random() < min(0.25, fb):
+                                self.materials[ny, nx] = 1  # food
+
+            # Emit resources (workshop/foundry/quarry/farm)
+            emit: Dict[int, float] = props.get("emit", {})
+            if emit:
+                r = int(props.get("emit_radius", 1))
+                for (y, x) in zip(ys, xs):
+                    # try a handful of emission attempts per site
+                    for _ in range(2):
+                        dy, dx = int(self.rng.integers(-r, r + 1)), int(self.rng.integers(-r, r + 1))
+                        ny, nx = y + dy, x + dx
+                        if 0 <= ny < H and 0 <= nx < W and self.materials[ny, nx] == 0:
+                            # choose a material to emit, weighted by per-material p
+                            for mat, p in emit.items():
+                                if self.rng.random() < float(p):
+                                    self.materials[ny, nx] = int(mat)
+                                    break  # one placement per attempt
 
     def grow_food_near_pantry(self, radius: int = 4, k: int = 4) -> int:
         if self.pantry is None:
@@ -219,21 +242,19 @@ class World:
         take = min(have, n); self.caches[(y, x)] = have - take
         return take
 
-    # learning hooks ---------------------------------------------------------
+    # learning hooks
     def reinforce_path(self, path, amount: float = 1.0) -> None:
-        """Increase road-desire along a recently successful carrying path."""
         if not path:
             return
         for (y, x) in path:
             if 0 <= y < self.cfg.height and 0 <= x < self.cfg.width:
                 self.road_desire[y, x] = min(self.road_desire[y, x] + amount, 50.0)
 
-    # exploration marking ----------------------------------------------------
+    # exploration marking
     def mark_visit(self, y: int, x: int, amount: float = 1.0) -> None:
-        """Increment exploration heat where agents walk."""
         self.explore[y, x] = min(self.explore[y, x] + amount, 100.0)
 
-    # comms helpers ----------------------------------------------------------
+    # comms / learning auras
     def comm_bonus_at(self, y: int, x: int) -> int:
         r = 2
         y0, y1 = max(0, y - r), min(self.cfg.height, y + r + 1)
@@ -241,10 +262,23 @@ class World:
         patch = self.materials[y0:y1, x0:x1]
         bonus = 0
         if np.any(patch == 9): bonus = max(bonus, 3)
-        for code, props in self.struct_defs.items():
-            if props.get("comms_bonus", 0) > 0 and np.any(patch == code):
+        for c, props in self.struct_defs.items():
+            if props.get("comms_bonus", 0) > 0 and np.any(patch == c):
                 bonus = max(bonus, int(props["comms_bonus"]))
         return bonus
+
+    def iq_aura_at(self, y: int, x: int) -> float:
+        """Return learning boost from nearby dynamic structures."""
+        r = 2
+        y0, y1 = max(0, y - r), min(self.cfg.height, y + r + 1)
+        x0, x1 = max(0, x - r), min(self.cfg.width, x + r + 1)
+        patch = self.materials[y0:y1, x0:x1]
+        boost = 0.0
+        for c, props in self.struct_defs.items():
+            aura = float(props.get("iq_aura", 0.0))
+            if aura > 0 and np.any(patch == c):
+                boost += aura
+        return min(boost, 0.01)  # cap per tick
 
     def neighbor_messages(self, agents: List["Agent"], idx: int, radius: int = 3):
         y, x = agents[idx].pos
