@@ -1,14 +1,11 @@
 """
 Live viewers using matplotlib.
 
-- run_live(...)        -> single-agent viewer
-- run_live_multi(...)  -> multi-agent viewer with:
-    * brushes: seed/tree/fiber/rock/road/cache/beacon (keys 1..7,9; 0=erase)
-    * pantry/base in center
-    * auto food growth near pantry every ~2 seconds
-    * caches (local depots), roads (cheap movement), beacons (bigger comms)
+- run_live(...)        -> single-agent viewer (infinite)
+- run_live_multi(...)  -> multi-agent viewer (infinite) with:
+    * anti-congestion adaptive auto-growth
+    * seed/tree/fiber/rock/road/cache/beacon brushes (1..7,9; 0=erase)
     * batch doubling reproduction when pantry store crosses threshold
-    * **NO STEP CAP** — runs until you close the window
 """
 import time
 from typing import List
@@ -18,6 +15,10 @@ from matplotlib import colors
 
 from .world import World, WorldConfig
 from .agents import Agent
+
+COST_PER_NEW = 10     # per newborn for doubling
+CROWD_CAP = 6         # if >= this many agents near pantry, suppress inner growth
+
 
 # ----------------------------- Single-agent ---------------------------------
 
@@ -89,11 +90,12 @@ def run_live(
     delay = 1.0 / max(1, fps)
     grow_every = max(1, int(2 * fps))  # ~2 seconds
 
-    # run until window is closed
+    # infinite run
     while plt.fignum_exists(fig.number):
         agent.act(world)
         world.step()
 
+        # auto-grow food near pantry (simple, single-agent)
         if world.tick % grow_every == 0:
             world.grow_food_near_pantry(radius=4, k=4)
 
@@ -101,7 +103,9 @@ def run_live(
         dot.set_offsets(np.c_[[agent.pos[1]], [agent.pos[0]]])
         hud.set_text(f"tick {world.tick} | store {world.shared_store} | brush {current_brush}")
         plt.pause(0.001); time.sleep(delay)
+
     plt.close(fig)
+
 
 # ---------------------------- Multi-agent -----------------------------------
 
@@ -137,7 +141,7 @@ def run_live_multi(
     norm = colors.BoundaryNorm(list(range(11)), cmap.N)
 
     fig, ax = plt.subplots(figsize=(width / 8, height / 8))
-    try: fig.canvas.manager.set_window_title("Evo Beings — Live Multi (Learning)")
+    try: fig.canvas.manager.set_window_title("Evo Beings — Live Multi (Adaptive Growth)")
     except Exception: pass
 
     img = ax.imshow(world.materials * 1, cmap=cmap, norm=norm, interpolation="nearest")
@@ -181,8 +185,7 @@ def run_live_multi(
     fig.canvas.mpl_connect("key_press_event", on_key)
     fig.canvas.mpl_connect("button_press_event", on_click)
 
-    COST_PER_NEW = 10  # per newborn for doubling
-
+    # reproduction helper
     def try_spawn_near_pantry() -> bool:
         seed_rng = np.random.default_rng(world.tick * 17 + len(agents))
         for _ in range(200):
@@ -200,7 +203,7 @@ def run_live_multi(
     delay = 1.0 / max(1, fps)
     grow_every = max(1, int(2 * fps))  # ~2 seconds
 
-    # run until the figure is closed
+    # infinite run
     while plt.fignum_exists(fig.number):
         # agents act
         for i, a in enumerate(agents):
@@ -208,11 +211,19 @@ def run_live_multi(
             a.act(world, inbox)
         world.step()
 
-        # auto-grow food near pantry
+        # ---- adaptive auto-growth ----
         if world.tick % grow_every == 0:
-            world.grow_food_near_pantry(radius=4, k=6)
+            # count agents near pantry
+            py, px = world.pantry
+            near = sum(1 for a in agents if abs(a.pos[0]-py)+abs(a.pos[1]-px) <= 4)
+            # if crowded or store already high vs pop, grow in an outer ring
+            target = COST_PER_NEW * max(1, len(agents))
+            if near >= CROWD_CAP or world.shared_store > target:
+                world.grow_food_ring(r_min=5, r_max=9, k=6)
+            else:
+                world.grow_food_near_pantry(radius=4, k=3)
 
-        # batch reproduction: double pop whenever store allows
+        # ---- batch reproduction: double pop whenever store allows ----
         doubled = 0
         while True:
             pop = len(agents)
@@ -236,16 +247,13 @@ def run_live_multi(
         ys = [a.pos[0] for a in agents]; xs = [a.pos[1] for a in agents]
         scat.set_offsets(np.c_[xs, ys]); scat.set_color(agent_colors)
 
-        # HUD also shows average road desire near pantry as a quick proxy
+        # HUD
         py, px = world.pantry
-        patch = world.road_desire[max(0,py-3):py+4, max(0,px-3):px+4]
-        desir = float(patch.mean()) if patch.size else 0.0
-        chatter = sum((getattr(a, "last_msg", np.zeros(4)) > 0.6).sum() for a in agents)
+        near = sum(1 for a in agents if abs(a.pos[0]-py)+abs(a.pos[1]-px) <= 4)
         hud.set_text(
-            f"tick {world.tick} | agents {len(agents)} | store {world.shared_store} | doubled x{doubled} | brush {current_brush} | roadDes {desir:.2f} | chatter {int(chatter)}"
+            f"tick {world.tick} | agents {len(agents)} | store {world.shared_store} | doubled x{doubled} | nearPantry {near} | brush {current_brush}"
         )
 
         plt.pause(0.001); time.sleep(delay)
 
     plt.close(fig)
-6

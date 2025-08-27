@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Tuple, Dict, Any, List
 import numpy as np
 
+
 @dataclass
 class WorldConfig:
     width: int = 64
@@ -26,6 +27,7 @@ class WorldConfig:
     resource_density: float = 0.0      # start empty; observer/agents add stuff
     season_period: int = 400
     seed: int = 7
+
 
 class World:
     def __init__(self, cfg: WorldConfig):
@@ -82,24 +84,48 @@ class World:
         self.road_desire *= 0.9995
 
     def grow_food_near_pantry(self, radius: int = 4, k: int = 4) -> int:
-        """Try to spawn up to k new food tiles near pantry on empty cells."""
+        """Spawn up to k new food tiles near pantry on empty cells (disc)."""
         if self.pantry is None:
             return 0
         py, px = self.pantry
-        candidates: List[Tuple[int, int]] = []
         H, W = self.materials.shape
+        cand: List[Tuple[int, int]] = []
         for dy in range(-radius, radius + 1):
             for dx in range(-radius, radius + 1):
                 if abs(dy) + abs(dx) > radius:
                     continue
                 y, x = py + dy, px + dx
                 if 0 <= y < H and 0 <= x < W and self.materials[y, x] == 0:
-                    candidates.append((y, x))
-        if not candidates:
+                    cand.append((y, x))
+        if not cand:
             return 0
-        self.rng.shuffle(candidates)
+        self.rng.shuffle(cand)
         placed = 0
-        for (y, x) in candidates[:k]:
+        for (y, x) in cand[:k]:
+            self.materials[y, x] = 1
+            placed += 1
+        return placed
+
+    def grow_food_ring(self, r_min: int = 5, r_max: int = 9, k: int = 6) -> int:
+        """Spawn up to k food tiles in an annulus around the pantry (pulls agents outward)."""
+        if self.pantry is None:
+            return 0
+        py, px = self.pantry
+        H, W = self.materials.shape
+        cand: List[Tuple[int, int]] = []
+        for dy in range(-r_max, r_max + 1):
+            for dx in range(-r_max, r_max + 1):
+                d = abs(dy) + abs(dx)
+                if d < r_min or d > r_max:
+                    continue
+                y, x = py + dy, px + dx
+                if 0 <= y < H and 0 <= x < W and self.materials[y, x] == 0:
+                    cand.append((y, x))
+        if not cand:
+            return 0
+        self.rng.shuffle(cand)
+        placed = 0
+        for (y, x) in cand[:k]:
             self.materials[y, x] = 1
             placed += 1
         return placed
