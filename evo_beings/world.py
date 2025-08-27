@@ -1,5 +1,7 @@
 """
-World: discrete grid with resources, seeds, pantry/base, and simple structures.
+World: discrete grid with resources, seeds, pantry/base, structures, and
+a decaying 'road desire' field that agents reinforce after successful hauls.
+
 Material codes:
   0 = empty
   1 = food/resource
@@ -21,7 +23,7 @@ class WorldConfig:
     width: int = 64
     height: int = 40
     max_energy: float = 10.0
-    resource_density: float = 0.0      # start empty; only observer/agents add stuff
+    resource_density: float = 0.0      # start empty; observer/agents add stuff
     season_period: int = 400
     seed: int = 7
 
@@ -38,7 +40,10 @@ class World:
         # economy/state
         self.shared_store: int = 0                  # pantry food
         self.pantry: Tuple[int, int] | None = None
-        self.caches: Dict[Tuple[int, int], int] = {}  # per-tile food stores for caches
+        self.caches: Dict[Tuple[int, int], int] = {}  # per-tile food stores
+
+        # learning: desirability of placing roads on cells (reinforced by hauls)
+        self.road_desire = np.zeros((cfg.height, cfg.width), dtype=np.float32)
 
         self._seed_resources()
 
@@ -73,6 +78,8 @@ class World:
         # seeds ripen every 6 ticks
         if self.tick % 6 == 0:
             self.materials[self.materials == 2] = 1
+        # road desire slowly decays
+        self.road_desire *= 0.9995
 
     def grow_food_near_pantry(self, radius: int = 4, k: int = 4) -> int:
         """Try to spawn up to k new food tiles near pantry on empty cells."""
@@ -105,7 +112,7 @@ class World:
             return 1
         return 0
 
-    # ---------- building & comms ----------
+    # ---------- building & learning ----------
     def add_pantry(self, y: int, x: int) -> None:
         self.materials[y, x] = 3
         self.pantry = (y, x)
@@ -146,6 +153,14 @@ class World:
         take = min(have, n)
         self.caches[(y, x)] = have - take
         return take
+
+    # learning hooks
+    def reinforce_path(self, path: List[Tuple[int, int]], amount: float = 1.0) -> None:
+        """Increase road desire along a recently successful carrying path."""
+        if not path:
+            return
+        for (y, x) in path:
+            self.road_desire[y, x] = min(self.road_desire[y, x] + amount, 50.0)  # cap
 
     # comms helpers
     def near_beacon(self, y: int, x: int, r: int = 1) -> bool:
