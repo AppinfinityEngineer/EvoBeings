@@ -63,3 +63,17 @@ class World:
         y = int(np.clip(y, 0, self.cfg.height - 1))
         x = int(np.clip(x, 0, self.cfg.width - 1))
         return y, x
+    
+    # inside World class
+    def neighbor_messages(self, agents, idx: int, radius: int = 3):
+        y, x = agents[idx].pos
+        msgs = []
+        for j, a in enumerate(agents):
+            if j == idx:
+                continue
+            ay, ax = a.pos
+            if abs(ay - y) + abs(ax - x) <= radius:
+                msgs.append(getattr(a, "last_msg", np.zeros(4, dtype=np.float32)))
+        return msgs
+
+        
