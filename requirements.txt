@@ -1,4 +1,6 @@
 numpy
+tqdm
+matplotlib
 torch
 tqdm
 rich
