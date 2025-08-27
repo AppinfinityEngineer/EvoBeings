@@ -64,7 +64,7 @@ class World:
         self.temp += 0.01 * np.sin(2 * np.pi * self.tick / self.cfg.season_period)
         self.energy *= 0.999
         # seeds ripen every 10 ticks
-        if self.tick % 10 == 0:
+        if self.tick % 6 == 0:
             self.materials[self.materials == 2] = 1
 
     def harvest(self, pos: Tuple[int, int], kind: int = 1) -> int:

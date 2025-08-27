@@ -65,7 +65,8 @@ class Agent:
             else:
                 dy, dx = [(0,1),(0,-1),(1,0),(-1,0)][np.random.randint(0,4)]
 
-        use = 1 if (dy == 0 and dx == 0) else 0
+        on_food = (mats[h//2, w//2] == 1)
+        use = 1 if on_food or (dy == 0 and dx == 0) else 0
 
         dens = float((mats == 1).mean())
         msg = np.clip(np.random.rand(4) * (0.5 + dens), 0, 1).astype(np.float32)
@@ -79,15 +80,17 @@ class Agent:
 
         # harvest if staying
         if decision["use"] == 1:
-            self.inventory += world.harvest(self.pos, kind=1)
-            if self.inventory > 0:
-                self.energy += 0.2
+         gained = world.harvest(self.pos, kind=1)
+         if gained > 0:
+            self.inventory += gained
+            self.energy = min(self.energy + 0.5, 5.0)  # better refuel, capped
 
         # deposit at pantry
         y, x = self.pos
         if world.materials[y, x] == 3 and self.inventory > 0:
             world.shared_store += self.inventory
             self.inventory = 0
+            self.energy = min(self.energy + 0.2, 5.0)  # rest at base
 
-        self.energy -= 0.01
+        self.energy -= 0.005
         self.last_msg = decision["msg"]
