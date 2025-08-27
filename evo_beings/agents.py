@@ -1,7 +1,7 @@
 """
-Agents: simple beings that move, harvest multiple resources, craft a small 'tool',
-occasionally place structures, deposit at pantry, and broadcast a tiny message vector.
-No scripted jobs; pantry return is a bias when carrying food; crafting/building emerge from inventory state.
+Agents: gather multiple resources, prefer pantry when carrying food, craft a simple tool,
+occasionally build roads/caches/beacons, use caches as intermediate depots, and broadcast a tiny message vector.
+Still no scripted jobs; behaviors stem from local state + world affordances.
 """
 from dataclasses import dataclass, field
 from typing import Tuple, Dict, Any, Set, List
@@ -15,7 +15,7 @@ class Agent:
     inventory: Dict[str, int] = field(default_factory=lambda: {"food": 0, "wood": 0, "fiber": 0, "stone": 0})
     visited: Set[Tuple[int, int]] = field(default_factory=set)
     last_msg: np.ndarray = field(default_factory=lambda: np.zeros(4, dtype=np.float32))
-    tool_level: int = 0  # emergent 'profession' support: boosts harvest/efficiency a bit
+    tool_level: int = 0  # boosts efficiency a bit
 
     def act(self, world: World, inbox: List[np.ndarray] = None) -> Dict[str, Any]:
         if inbox is None:
@@ -32,21 +32,19 @@ class Agent:
         h, w = mats.shape
         cy, cx = h // 2, w // 2
 
-        # tiny neighbor bias (proximity awareness)
+        # neighbor bias (proximity signal)
         msg_bias = 0.0
         if inbox:
             m = np.stack(inbox).mean(0)
-            msg_bias = float(m.mean()) - 0.5  # [-0.5, +0.5]
+            msg_bias = float(m.mean()) - 0.5
 
         # pantry homing when carrying food
         toward_pantry = None
         if self.inventory["food"] > 0 and world.pantry is not None:
             ay, ax = self.pos
-            dy = int(np.sign(world.pantry[0] - ay))
-            dx = int(np.sign(world.pantry[1] - ax))
-            toward_pantry = (dy, dx)
+            toward_pantry = (int(np.sign(world.pantry[0] - ay)), int(np.sign(world.pantry[1] - ax)))
 
-        # Perception: nearest of a given kind within local window
+        # find nearest of a type in local window
         def nearest_of(val: int):
             ys, xs = np.where(mats == val)
             if len(ys) == 0:
@@ -55,30 +53,30 @@ class Agent:
             ty, tx = int(ys[idx]), int(xs[idx])
             return (int(np.sign(ty - cy)), int(np.sign(tx - cx)))
 
-        # Goal preferences (unscripted but state-driven):
-        # 1) If on food -> harvest now.
+        # priorities:
+        # 1) if on food, harvest
         on_food = (mats[cy, cx] == 1)
 
-        # 2) If carrying food -> strongly go to pantry.
+        # 2) if carrying food, go home most of the time
         if toward_pantry is not None and np.random.rand() < 0.85:
             dy, dx = toward_pantry
         else:
-            # 3) If we lack a tool, prefer harvesting wood/fiber to craft
             move = None
+            # 3) if no tool, seek wood/fiber to craft
             if self.tool_level == 0:
-                move = nearest_of(4) or nearest_of(5)  # tree or fiber
-            # 4) Otherwise prefer food if visible
+                move = nearest_of(4) or nearest_of(5)
+            # 4) else prefer food if visible
             if move is None:
                 move = nearest_of(1)
-            # 5) Explore if nothing salient, with slight anti-crowding bias
+            # 5) otherwise explore, with tiny anti-crowding bias
             if move is None or np.random.rand() < (0.15 + 0.2 * max(0.0, -msg_bias)):
                 move = [(0,1),(0,-1),(1,0),(-1,0)][np.random.randint(0,4)]
             dy, dx = move
 
-        # Use (harvest) if standing on something harvestable
+        # harvest/use if standing or staying
         use = 1 if on_food or (dy == 0 and dx == 0) else 0
 
-        # Broadcast: random, nudged by local food density (placeholder channel)
+        # broadcast (placeholder channel)
         dens = float((mats == 1).mean())
         msg = np.clip(np.random.rand(4) * (0.5 + dens), 0, 1).astype(np.float32)
         return {"move": (dy, dx), "use": use, "msg": msg}
@@ -90,19 +88,16 @@ class Agent:
         ny, nx = world.in_bounds(self.pos[0] + dy, self.pos[1] + dx)
         self.pos = (ny, nx)
         self.visited.add(self.pos)
-
         y, x = self.pos
         tile = int(world.materials[y, x])
 
         # HARVEST
         if decision["use"] == 1:
-            # harvest whatever we are standing on if valid
-            if tile in (1, 4, 5, 6):
+            if tile in (1, 4, 5, 6):  # food/wood/fiber/stone
                 gained = world.harvest(self.pos, kind=tile)
                 if gained > 0:
                     if tile == 1:
                         self.inventory["food"] += gained
-                        # eating/foraging replenishes energy
                         self.energy = min(self.energy + (0.5 + 0.1 * self.tool_level), 5.0)
                     elif tile == 4:
                         self.inventory["wood"] += gained
@@ -111,30 +106,47 @@ class Agent:
                     elif tile == 6:
                         self.inventory["stone"] += gained
 
-        # CRAFT (unscripted trigger: if we have enough mats and no tool)
+        # CRAFT simple tool
         if self.tool_level == 0 and self.inventory["wood"] >= 2 and self.inventory["fiber"] >= 1:
-            # consume materials to craft a basic tool that increases efficiency slightly
             self.inventory["wood"] -= 2
             self.inventory["fiber"] -= 1
             self.tool_level = 1
 
-        # PLACE STRUCTURE (unscripted marker when carrying lots of raw mats)
-        if world.materials[y, x] == 0 and (self.inventory["stone"] >= 1 or self.inventory["wood"] >= 2):
-            if np.random.rand() < 0.03:  # rare
-                if world.place_structure(y, x):
-                    if self.inventory["stone"] >= 1:
-                        self.inventory["stone"] -= 1
-                    else:
-                        self.inventory["wood"] = max(0, self.inventory["wood"] - 2)
+        # BUILD occasionally (emergent world-shaping)
+        if world.materials[y, x] == 0:
+            r = np.random.rand()
+            if self.inventory["stone"] >= 1 and r < 0.03:
+                if world.place_road(y, x):
+                    self.inventory["stone"] -= 1
+            elif self.inventory["wood"] >= 3 and r < 0.05:
+                if world.place_cache(y, x):
+                    # start the cache with some of our wood turned into food? no — just empty;
+                    # but if we have food, deposit to cache below.
+                    pass
+            elif self.inventory["fiber"] >= 3 and r < 0.02:
+                if world.place_beacon(y, x):
+                    self.inventory["fiber"] -= 3
 
-        # DEPOSIT at pantry (and rest bonus)
+        # CACHE interaction: deposit if carrying food; withdraw if empty and cache has stock
+        if world.materials[y, x] == 8:
+            if self.inventory["food"] > 0:
+                world.cache_deposit(y, x, self.inventory["food"])
+                self.inventory["food"] = 0
+            elif self.inventory["food"] == 0 and world.caches.get((y, x), 0) > 0:
+                taken = world.cache_take(y, x, 1)
+                self.inventory["food"] += taken
+
+        # PANTRY deposit (and rest bonus)
         if world.materials[y, x] == 3 and self.inventory["food"] > 0:
             world.shared_store += self.inventory["food"]
             self.inventory["food"] = 0
             self.energy = min(self.energy + 0.2, 5.0)
 
-        # ENERGY drain
-        self.energy -= 0.005
+        # ENERGY drain (roads are cheaper)
+        move_cost = 0.005
+        if tile == 7:  # road
+            move_cost *= 0.6
+        self.energy -= move_cost
 
         # remember last message
         self.last_msg = decision["msg"]
