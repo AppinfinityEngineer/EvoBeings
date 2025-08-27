@@ -2,14 +2,20 @@
 Live viewers using matplotlib.
 
 - run_live(...)        -> single-agent viewer
-- run_live_multi(...)  -> multi-agent viewer with seed planting, pantry, and doubling reproduction
+- run_live_multi(...)  -> multi-agent viewer with:
+    * seed/tree/fiber/rock planting via hotkeys
+    * pantry/base in center
+    * agents harvest/craft/place markers/deposit
+    * batch doubling reproduction when store threshold is met
 
-Colors:
-  empty  = dark gray
-  food   = green
-  seed   = teal
-  pantry = white square
-  agents = colored dots (scatter)
+Hotkeys / mouse:
+  1 = Seed brush (teal)       (click to place)
+  2 = Tree brush (wood)       (click to place)
+  3 = Fiber brush (purple)    (click to place)
+  4 = Rock brush (stone)      (click to place)
+  0 = Eraser                  (right-click always erases)
+  Left click  = place current brush
+  Right click = erase (empty)
 """
 import time
 from typing import List
@@ -20,9 +26,7 @@ from matplotlib import colors
 from .world import World, WorldConfig
 from .agents import Agent
 
-
 # ----------------------------- Single-agent ---------------------------------
-
 
 def run_live(
     width: int = 48,
@@ -42,34 +46,55 @@ def run_live(
     start = (rng.integers(0, height), rng.integers(0, width))
     agent = Agent(pos=start)
 
-    cmap = colors.ListedColormap(["#2b2b2b", "#2e7d32", "#00897b", "#ffffff"])
-    norm = colors.BoundaryNorm([0, 1, 2, 3, 4], cmap.N)
+    cmap = colors.ListedColormap([
+        "#2b2b2b",  # 0 empty
+        "#2e7d32",  # 1 food
+        "#00897b",  # 2 seed
+        "#ffffff",  # 3 pantry
+        "#8d6e63",  # 4 tree (wood)
+        "#7e57c2",  # 5 fiber bush
+        "#90a4ae",  # 6 rock
+        "#ffab00",  # 7 structure/marker
+    ])
+    norm = colors.BoundaryNorm(list(range(9)), cmap.N)
 
     fig, ax = plt.subplots(figsize=(width / 8, height / 8))
-    try:
-        fig.canvas.manager.set_window_title("Evo Beings — Live MVP")
-    except Exception:
-        pass
+    try: fig.canvas.manager.set_window_title("Evo Beings — Live MVP")
+    except Exception: pass
 
     img = ax.imshow(world.materials * 1, cmap=cmap, norm=norm, interpolation="nearest")
     dot = ax.scatter([agent.pos[1]], [agent.pos[0]], s=50, c="#fdd835")
     hud = ax.text(2, 1, "", color="white", fontsize=8)
 
-    ax.set_xticks([])
-    ax.set_yticks([])
-    plt.tight_layout()
-    plt.pause(0.001)
+    ax.set_xticks([]); ax.set_yticks([])
+    plt.tight_layout(); plt.pause(0.001)
 
-    # click-to-plant seeds
+    current_brush = 1  # default: seed
+
+    def on_key(ev):
+        nonlocal current_brush
+        if ev.key == "1": current_brush = 2  # seed code
+        elif ev.key == "2": current_brush = 4  # tree
+        elif ev.key == "3": current_brush = 5  # fiber
+        elif ev.key == "4": current_brush = 6  # rock
+        elif ev.key == "0": current_brush = 0  # eraser
+
     def on_click(ev):
         if ev.inaxes is not ax or ev.xdata is None or ev.ydata is None:
             return
-        y = int(round(ev.ydata))
-        x = int(round(ev.xdata))
+        y = int(round(ev.ydata)); x = int(round(ev.xdata))
         y = max(0, min(world.cfg.height - 1, y))
         x = max(0, min(world.cfg.width - 1, x))
-        world.place_seed(y, x)
+        if ev.button == 3:  # right click erase
+            world.materials[y, x] = 0
+            return
+        # left click: place according to brush
+        if current_brush == 2: world.place_seed(y, x)
+        elif current_brush == 4: world.place_tree(y, x)
+        elif current_brush == 5: world.place_fiber(y, x)
+        elif current_brush == 6: world.place_rock(y, x)
 
+    fig.canvas.mpl_connect("key_press_event", on_key)
     fig.canvas.mpl_connect("button_press_event", on_click)
 
     delay = 1.0 / max(1, fps)
@@ -79,31 +104,27 @@ def run_live(
 
         img.set_data(world.materials * 1)
         dot.set_offsets(np.c_[[agent.pos[1]], [agent.pos[0]]])
-        hud.set_text(f"tick {world.tick} | store {world.shared_store}")
-
-        plt.pause(0.001)
-        time.sleep(delay)
-
+        hud.set_text(f"tick {world.tick} | store {world.shared_store} | brush {current_brush}")
+        plt.pause(0.001); time.sleep(delay)
     plt.show()
 
-
 # ---------------------------- Multi-agent -----------------------------------
-
 
 def run_live_multi(
     n_agents: int = 1,
     width: int = 64,
     height: int = 40,
-    steps: int = 1200,
+    steps: int = 2000,
     seed: int = 21,
     fps: int = 18,
     comm_radius: int = 3,
 ) -> None:
     """
-    Multi-agent viewer with:
-      - click-to-plant seeds
-      - central pantry (deposit here)
-      - **doubling reproduction**: when store >= COST_PER_NEW * pop -> spawn `pop` new agents
+    Multi-agent viewer:
+      - Seed/Tree/Fiber/Rock brushes via 1/2/3/4 keys, 0=eraser. Left-click to place; right-click to erase.
+      - Pantry in center; agents deposit food there.
+      - Doubling reproduction: when store >= COST_PER_NEW * pop -> spawn `pop` new agents.
+      - Agents may craft a tool (wood+wood+fiber) and sometimes place structures (using stone or wood).
     """
     cfg = WorldConfig(width=width, height=height, seed=seed, resource_density=0.0)
     world = World(cfg)
@@ -125,41 +146,58 @@ def run_live_multi(
                 break
         agents.append(Agent(pos=pos))
 
-    cmap = colors.ListedColormap(["#2b2b2b", "#2e7d32", "#00897b", "#ffffff"])
-    norm = colors.BoundaryNorm([0, 1, 2, 3, 4], cmap.N)
+    cmap = colors.ListedColormap([
+        "#2b2b2b",  # 0 empty
+        "#2e7d32",  # 1 food
+        "#00897b",  # 2 seed
+        "#ffffff",  # 3 pantry
+        "#8d6e63",  # 4 tree (wood)
+        "#7e57c2",  # 5 fiber bush
+        "#90a4ae",  # 6 rock
+        "#ffab00",  # 7 structure/marker
+    ])
+    norm = colors.BoundaryNorm(list(range(9)), cmap.N)
 
     fig, ax = plt.subplots(figsize=(width / 8, height / 8))
-    try:
-        fig.canvas.manager.set_window_title("Evo Beings — Live Multi")
-    except Exception:
-        pass
+    try: fig.canvas.manager.set_window_title("Evo Beings — Live Multi")
+    except Exception: pass
 
     img = ax.imshow(world.materials * 1, cmap=cmap, norm=norm, interpolation="nearest")
 
     # distinct colors per agent
     colormap = plt.cm.get_cmap("tab10", max(n_agents, 10))
     agent_colors = [colormap(i % colormap.N) for i in range(n_agents)]
-
-    ys = [a.pos[0] for a in agents]
-    xs = [a.pos[1] for a in agents]
+    ys = [a.pos[0] for a in agents]; xs = [a.pos[1] for a in agents]
     scat = ax.scatter(xs, ys, s=50, c=agent_colors)
 
     hud = ax.text(2, 1, "", color="white", fontsize=8)
-    ax.set_xticks([])
-    ax.set_yticks([])
-    plt.tight_layout()
-    plt.pause(0.001)
+    ax.set_xticks([]); ax.set_yticks([])
+    plt.tight_layout(); plt.pause(0.001)
 
-    # click-to-plant seeds
+    # brushes
+    current_brush = 2  # seed
+    def on_key(ev):
+        nonlocal current_brush
+        if ev.key == "1": current_brush = 2   # seed
+        elif ev.key == "2": current_brush = 4 # tree
+        elif ev.key == "3": current_brush = 5 # fiber
+        elif ev.key == "4": current_brush = 6 # rock
+        elif ev.key == "0": current_brush = 0 # eraser
     def on_click(ev):
         if ev.inaxes is not ax or ev.xdata is None or ev.ydata is None:
             return
-        y = int(round(ev.ydata))
-        x = int(round(ev.xdata))
+        y = int(round(ev.ydata)); x = int(round(ev.xdata))
         y = max(0, min(world.cfg.height - 1, y))
         x = max(0, min(world.cfg.width - 1, x))
-        world.place_seed(y, x)
+        if ev.button == 3:
+            world.materials[y, x] = 0
+            return
+        if current_brush == 2: world.place_seed(y, x)
+        elif current_brush == 4: world.place_tree(y, x)
+        elif current_brush == 5: world.place_fiber(y, x)
+        elif current_brush == 6: world.place_rock(y, x)
 
+    fig.canvas.mpl_connect("key_press_event", on_key)
     fig.canvas.mpl_connect("button_press_event", on_click)
 
     # --- reproduction cost (per newborn) ---
@@ -189,47 +227,34 @@ def run_live_multi(
         world.step()
 
         # --- batch reproduction: DOUBLE the population when the store allows ---
-        # Each doubling costs COST_PER_NEW * current_pop
         doubled = 0
         while True:
             pop = len(agents)
             need = COST_PER_NEW * pop
             if world.shared_store < need:
                 break
-
-            # consume resources for this doubling
             world.shared_store -= need
-
-            # spawn `pop` new agents (double pop)
             spawned = 0
             for _ in range(pop):
                 if try_spawn_near_pantry():
                     spawned += 1
                 else:
-                    # couldn't place all; refund unused cost
                     world.shared_store += COST_PER_NEW * (pop - spawned)
                     break
-
             if spawned == 0:
-                # no space at all; stop attempting this tick
                 break
-
             doubled += 1
 
         # draw frame
         img.set_data(world.materials * 1)
-        ys = [a.pos[0] for a in agents]
-        xs = [a.pos[1] for a in agents]
-        scat.set_offsets(np.c_[xs, ys])
-        scat.set_color(agent_colors)
+        ys = [a.pos[0] for a in agents]; xs = [a.pos[1] for a in agents]
+        scat.set_offsets(np.c_[xs, ys]); scat.set_color(agent_colors)
 
-        # simple chatter proxy (if your Agent sets last_msg)
         chatter = sum((getattr(a, "last_msg", np.zeros(4)) > 0.6).sum() for a in agents)
         hud.set_text(
-            f"tick {world.tick} | agents {len(agents)} | store {world.shared_store} | doubled x{doubled} | chatter {int(chatter)}"
+            f"tick {world.tick} | agents {len(agents)} | store {world.shared_store} | doubled x{doubled} | brush {current_brush} | chatter {int(chatter)}"
         )
 
-        plt.pause(0.001)
-        time.sleep(delay)
+        plt.pause(0.001); time.sleep(delay)
 
     plt.show()
