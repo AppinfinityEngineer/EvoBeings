@@ -1,5 +1,7 @@
 """
-World: discrete grid with resources, seeds, pantry/base, and simple structures.
+World: discrete grid with resources, seeds, pantry/base, structures, and
+a decaying 'road desire' field that agents reinforce after successful hauls.
+
 Material codes:
   0 = empty
   1 = food/resource
@@ -16,14 +18,16 @@ from dataclasses import dataclass
 from typing import Tuple, Dict, Any, List
 import numpy as np
 
+
 @dataclass
 class WorldConfig:
     width: int = 64
     height: int = 40
     max_energy: float = 10.0
-    resource_density: float = 0.0      # start empty; only observer/agents add stuff
+    resource_density: float = 0.0      # start empty; observer/agents add stuff
     season_period: int = 400
     seed: int = 7
+
 
 class World:
     def __init__(self, cfg: WorldConfig):
@@ -38,7 +42,10 @@ class World:
         # economy/state
         self.shared_store: int = 0                  # pantry food
         self.pantry: Tuple[int, int] | None = None
-        self.caches: Dict[Tuple[int, int], int] = {}  # per-tile food stores for caches
+        self.caches: Dict[Tuple[int, int], int] = {}  # per-tile food stores
+
+        # learning: desirability of placing roads on cells (reinforced by hauls)
+        self.road_desire = np.zeros((cfg.height, cfg.width), dtype=np.float32)
 
         self._seed_resources()
 
@@ -73,26 +80,52 @@ class World:
         # seeds ripen every 6 ticks
         if self.tick % 6 == 0:
             self.materials[self.materials == 2] = 1
+        # road desire slowly decays
+        self.road_desire *= 0.9995
 
     def grow_food_near_pantry(self, radius: int = 4, k: int = 4) -> int:
-        """Try to spawn up to k new food tiles near pantry on empty cells."""
+        """Spawn up to k new food tiles near pantry on empty cells (disc)."""
         if self.pantry is None:
             return 0
         py, px = self.pantry
-        candidates: List[Tuple[int, int]] = []
         H, W = self.materials.shape
+        cand: List[Tuple[int, int]] = []
         for dy in range(-radius, radius + 1):
             for dx in range(-radius, radius + 1):
                 if abs(dy) + abs(dx) > radius:
                     continue
                 y, x = py + dy, px + dx
                 if 0 <= y < H and 0 <= x < W and self.materials[y, x] == 0:
-                    candidates.append((y, x))
-        if not candidates:
+                    cand.append((y, x))
+        if not cand:
             return 0
-        self.rng.shuffle(candidates)
+        self.rng.shuffle(cand)
         placed = 0
-        for (y, x) in candidates[:k]:
+        for (y, x) in cand[:k]:
+            self.materials[y, x] = 1
+            placed += 1
+        return placed
+
+    def grow_food_ring(self, r_min: int = 5, r_max: int = 9, k: int = 6) -> int:
+        """Spawn up to k food tiles in an annulus around the pantry (pulls agents outward)."""
+        if self.pantry is None:
+            return 0
+        py, px = self.pantry
+        H, W = self.materials.shape
+        cand: List[Tuple[int, int]] = []
+        for dy in range(-r_max, r_max + 1):
+            for dx in range(-r_max, r_max + 1):
+                d = abs(dy) + abs(dx)
+                if d < r_min or d > r_max:
+                    continue
+                y, x = py + dy, px + dx
+                if 0 <= y < H and 0 <= x < W and self.materials[y, x] == 0:
+                    cand.append((y, x))
+        if not cand:
+            return 0
+        self.rng.shuffle(cand)
+        placed = 0
+        for (y, x) in cand[:k]:
             self.materials[y, x] = 1
             placed += 1
         return placed
@@ -105,7 +138,7 @@ class World:
             return 1
         return 0
 
-    # ---------- building & comms ----------
+    # ---------- building & learning ----------
     def add_pantry(self, y: int, x: int) -> None:
         self.materials[y, x] = 3
         self.pantry = (y, x)
@@ -146,6 +179,14 @@ class World:
         take = min(have, n)
         self.caches[(y, x)] = have - take
         return take
+
+    # learning hooks
+    def reinforce_path(self, path: List[Tuple[int, int]], amount: float = 1.0) -> None:
+        """Increase road desire along a recently successful carrying path."""
+        if not path:
+            return
+        for (y, x) in path:
+            self.road_desire[y, x] = min(self.road_desire[y, x] + amount, 50.0)  # cap
 
     # comms helpers
     def near_beacon(self, y: int, x: int, r: int = 1) -> bool:
