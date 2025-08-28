@@ -14,9 +14,9 @@ from typing import List
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import colors
-
 from .world import World, WorldConfig
 from .agents import Agent
+from matplotlib.ticker import NullLocator  
 
 COST_PER_NEW = 10
 CROWD_CAP = 6
@@ -67,7 +67,20 @@ def run_live_multi(
     try: fig.canvas.manager.set_window_title("Evo Beings — Live Multi (Innovation & Learning)")
     except Exception: pass
 
-    img = ax.imshow(world.materials * 1, cmap=cmap, norm=norm, interpolation="nearest")
+    ax.set_xscale("linear")
+    ax.set_yscale("linear")
+    ax.set_xlim(-0.5, width - 0.5)
+    ax.set_ylim(height - 0.5, -0.5)
+    ax.xaxis.set_major_locator(NullLocator())
+    ax.yaxis.set_major_locator(NullLocator())
+
+    img = ax.imshow(
+        world.materials * 1,
+        cmap=cmap,
+        norm=norm,
+        interpolation="nearest",
+        origin="upper", 
+    )
     colormap = plt.cm.get_cmap("tab20", max(n_agents, 20))
     agent_colors = [colormap(i % colormap.N) for i in range(n_agents)]
     ys = [a.pos[0] for a in agents]; xs = [a.pos[1] for a in agents]
