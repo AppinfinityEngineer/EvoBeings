@@ -1,8 +1,9 @@
 """
 World with: resources, pantry, basic & dynamic structures, road-desire learning,
-a global exploration field, and dynamic effects (food_boost, emit, iq_aura, comms).
+a global exploration field, dynamic effects (food_boost, emit, iq_aura, comms),
+and automatic map expansion when agents reach the frontier.
 
-Fixed material codes:
+Material codes:
   0 empty, 1 food, 2 seed, 3 pantry, 4 tree, 5 fiber, 6 rock, 7 road, 8 cache, 9 beacon
 Dynamic invented structures: 10, 11, ... (runtime)
 """
@@ -27,9 +28,10 @@ class World:
         self.rng = np.random.default_rng(cfg.seed)
         self.tick = 0
 
+        # core fields
         self.materials = np.zeros((cfg.height, cfg.width), dtype=np.int16)
-        self.energy = np.zeros((cfg.height, cfg.width), dtype=np.float32)
-        self.temp = np.zeros((cfg.height, cfg.width), dtype=np.float32)
+        self.energy    = np.zeros((cfg.height, cfg.width), dtype=np.float32)
+        self.temp      = np.zeros((cfg.height, cfg.width), dtype=np.float32)
 
         # economy/state
         self.shared_store: int = 0
@@ -37,13 +39,16 @@ class World:
         self.caches: Dict[Tuple[int, int], int] = {}
 
         # learning / navigation fields
-        self.road_desire = np.zeros((cfg.height, cfg.width), dtype=np.float32)
-        self.explore     = np.zeros((cfg.height, cfg.width), dtype=np.float32)  # higher = well-trodden
+        self.road_desire = np.zeros((cfg.height, cfg.width), dtype=np.float32)  # learned preference for roads
+        self.explore     = np.zeros((cfg.height, cfg.width), dtype=np.float32)  # visitation heatmap
 
         # dynamic structure registry
-        # code -> { name, color, cache?, move_mult?, comms_bonus?, food_boost?, iq_aura?, emit{material->p}, emit_radius? }
+        # code -> { name, color, cache?, move_mult?, comms_bonus?, food_boost?, iq_aura?, emit{mat->p}, emit_radius? }
         self.struct_defs: Dict[int, Dict[str, Any]] = {}
         self.next_dyn_code: int = 10
+
+        # expansion cooldown bookkeeping
+        self._last_expand_tick: int = -10_000
 
         self._seed_resources()
 
@@ -73,10 +78,12 @@ class World:
     # ---------- dynamics ----------
     def step(self) -> None:
         self.tick += 1
+        # tiny seasonal temperature oscillation
         self.temp += 0.01 * np.sin(2 * np.pi * self.tick / self.cfg.season_period)
+        # slow energy decay
         self.energy *= 0.999
 
-        # seeds ripen
+        # seeds ripen into food
         if self.tick % 6 == 0:
             self.materials[self.materials == 2] = 1
 
@@ -84,7 +91,7 @@ class World:
         self.road_desire *= 0.9995
         self.explore     *= 0.9997
 
-        # dynamic structure effects every few ticks
+        # dynamic structure effects periodically
         if self.tick % 10 == 0:
             self._apply_dynamic_effects()
 
@@ -92,7 +99,6 @@ class World:
         """Apply effects of invented structures:
            - food_boost: small chance to spawn food in radius 2
            - emit: spawn specific materials near the structure
-           - iq_aura: handled in agents via iq_aura_at()
         """
         H, W = self.materials.shape
         for code, props in self.struct_defs.items():
@@ -116,16 +122,14 @@ class World:
             if emit:
                 r = int(props.get("emit_radius", 1))
                 for (y, x) in zip(ys, xs):
-                    # try a handful of emission attempts per site
-                    for _ in range(2):
+                    for _ in range(2):  # a few attempts per tick per site
                         dy, dx = int(self.rng.integers(-r, r + 1)), int(self.rng.integers(-r, r + 1))
                         ny, nx = y + dy, x + dx
                         if 0 <= ny < H and 0 <= nx < W and self.materials[ny, nx] == 0:
-                            # choose a material to emit, weighted by per-material p
                             for mat, p in emit.items():
                                 if self.rng.random() < float(p):
                                     self.materials[ny, nx] = int(mat)
-                                    break  # one placement per attempt
+                                    break
 
     def grow_food_near_pantry(self, radius: int = 4, k: int = 4) -> int:
         if self.pantry is None:
@@ -179,6 +183,7 @@ class World:
         self.pantry = (y, x)
 
     def ensure_pantry(self, y: int, x: int) -> None:
+        # simple “auto-repair” — always restore pantry
         self.add_pantry(y, x)
 
     def place(self, y: int, x: int, code: int) -> bool:
@@ -210,36 +215,47 @@ class World:
     def add_dynamic_structure_type(self, name: str, props: Dict[str, Any]) -> int:
         code = self.next_dyn_code
         self.next_dyn_code += 1
+
+        # pleasant random color if not provided
         hue = float(self.rng.random())
+
         def hsv_to_hex(h: float) -> str:
             i = int(h * 6) % 6
             f = h * 6 - int(h * 6); q = 1 - f
             rgb = [(1, f, 0),(q,1,0),(0,1,f),(0,q,1),(f,0,1),(1,0,q)][i]
             r, g, b = [int(255 * (0.6 + 0.4 * v)) for v in rgb]
             return f"#{r:02x}{g:02x}{b:02x}"
+
         color = props.pop("color", hsv_to_hex(hue))
         self.struct_defs[code] = {**props, "name": name, "color": color}
         return code
 
     def tile_props(self, code: int) -> Dict[str, Any]:
-        if code == 7: return {"move_mult": 0.6}
-        if code == 9: return {"comms_bonus": 3}
-        if code == 8: return {"cache": True}
-        if code in self.struct_defs: return self.struct_defs[code]
+        if code == 7:  # road
+            return {"move_mult": 0.6}
+        if code == 9:  # beacon
+            return {"comms_bonus": 3}
+        if code == 8:  # cache
+            return {"cache": True}
+        if code in self.struct_defs:
+            return self.struct_defs[code]
         return {}
 
     # caches API
     def cache_deposit(self, y: int, x: int, n: int) -> int:
         code = int(self.materials[y, x])
-        if not self.tile_props(code).get("cache", False): return 0
+        if not self.tile_props(code).get("cache", False):
+            return 0
         self.caches[(y, x)] = self.caches.get((y, x), 0) + n
         return n
 
     def cache_take(self, y: int, x: int, n: int) -> int:
         code = int(self.materials[y, x])
-        if not self.tile_props(code).get("cache", False): return 0
+        if not self.tile_props(code).get("cache", False):
+            return 0
         have = self.caches.get((y, x), 0)
-        take = min(have, n); self.caches[(y, x)] = have - take
+        take = min(have, n)
+        self.caches[(y, x)] = have - take
         return take
 
     # learning hooks
@@ -261,14 +277,15 @@ class World:
         x0, x1 = max(0, x - r), min(self.cfg.width, x + r + 1)
         patch = self.materials[y0:y1, x0:x1]
         bonus = 0
-        if np.any(patch == 9): bonus = max(bonus, 3)
+        if np.any(patch == 9):  # beacons
+            bonus = max(bonus, 3)
         for c, props in self.struct_defs.items():
             if props.get("comms_bonus", 0) > 0 and np.any(patch == c):
                 bonus = max(bonus, int(props["comms_bonus"]))
         return bonus
 
     def iq_aura_at(self, y: int, x: int) -> float:
-        """Return learning boost from nearby dynamic structures."""
+        """Return learning boost from nearby dynamic structures (capped per tick)."""
         r = 2
         y0, y1 = max(0, y - r), min(self.cfg.height, y + r + 1)
         x0, x1 = max(0, x - r), min(self.cfg.width, x + r + 1)
@@ -278,15 +295,81 @@ class World:
             aura = float(props.get("iq_aura", 0.0))
             if aura > 0 and np.any(patch == c):
                 boost += aura
-        return min(boost, 0.01)  # cap per tick
+        return min(boost, 0.01)
 
     def neighbor_messages(self, agents: List["Agent"], idx: int, radius: int = 3):
         y, x = agents[idx].pos
         r_eff = radius + self.comm_bonus_at(y, x)
         msgs = []
         for j, a in enumerate(agents):
-            if j == idx: continue
+            if j == idx:
+                continue
             ay, ax = a.pos
             if abs(ay - y) + abs(ax - x) <= r_eff:
                 msgs.append(getattr(a, "last_msg", np.zeros(4, dtype=np.float32)))
         return msgs
+
+    # ---------- auto expansion ----------
+    def expand_if_needed(self, agents: List["Agent"], margin: int = 8, pad: int = 32) -> int:
+        """
+        Pad the world on all sides if any agent/structure approaches the edge.
+        Expansion is throttled (cooldown) and hard-capped by MAX size.
+        Returns the pad amount (0 if no expansion).
+        """
+        # cooldown (~400 ticks between expansions)
+        if self.tick - self._last_expand_tick < 400:
+            return 0
+
+        H, W = self.materials.shape
+
+        # absolute cap to keep memory sane
+        MAX_H, MAX_W = 512, 512
+        if H >= MAX_H or W >= MAX_W:
+            return 0
+
+        # trigger if any agent is close to an edge
+        need = any(
+            (a.pos[0] < margin) or (a.pos[1] < margin) or
+            (H - 1 - a.pos[0] < margin) or (W - 1 - a.pos[1] < margin)
+            for a in agents
+        )
+        # also trigger if any non-empty cell is inside the margin band
+        if not need and margin > 0:
+            if (self.materials[:margin, :].any() or self.materials[-margin:, :].any() or
+                self.materials[:, :margin].any() or self.materials[:, -margin:].any()):
+                need = True
+        if not need:
+            return 0
+
+        # clamp pad so we do not exceed MAX
+        pad_h = min(pad, max(0, (MAX_H - H) // 2))
+        pad_w = min(pad, max(0, (MAX_W - W) // 2))
+        pad_use = int(min(pad_h, pad_w))
+        if pad_use <= 0:
+            return 0
+
+        # grow arrays
+        self.materials   = np.pad(self.materials,   ((pad_use, pad_use), (pad_use, pad_use)), mode="constant")
+        self.energy      = np.pad(self.energy,      ((pad_use, pad_use), (pad_use, pad_use)), mode="constant")
+        self.temp        = np.pad(self.temp,        ((pad_use, pad_use), (pad_use, pad_use)), mode="constant")
+        self.road_desire = np.pad(self.road_desire, ((pad_use, pad_use), (pad_use, pad_use)), mode="constant")
+        self.explore     = np.pad(self.explore,     ((pad_use, pad_use), (pad_use, pad_use)), mode="constant")
+
+        # shift caches & pantry
+        self.caches = {(y + pad_use, x + pad_use): v for (y, x), v in self.caches.items()}
+        if self.pantry is not None:
+            py, px = self.pantry
+            self.pantry = (py + pad_use, px + pad_use)
+
+        # update config (new size)
+        self.cfg = WorldConfig(
+            width=W + 2 * pad_use,
+            height=H + 2 * pad_use,
+            max_energy=self.cfg.max_energy,
+            resource_density=self.cfg.resource_density,
+            season_period=self.cfg.season_period,
+            seed=self.cfg.seed,
+        )
+
+        self._last_expand_tick = self.tick
+        return pad_use
