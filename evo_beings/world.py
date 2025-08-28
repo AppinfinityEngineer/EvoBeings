@@ -9,6 +9,7 @@ Dynamic invented structures: 10, 11, ... (runtime)
 """
 from dataclasses import dataclass
 from typing import Tuple, Dict, Any, List
+from collections import deque
 import numpy as np
 
 
@@ -30,8 +31,8 @@ class World:
 
         # core fields
         self.materials = np.zeros((cfg.height, cfg.width), dtype=np.int16)
-        self.energy    = np.zeros((cfg.height, cfg.width), dtype=np.float32)
-        self.temp      = np.zeros((cfg.height, cfg.width), dtype=np.float32)
+        self.energy = np.zeros((cfg.height, cfg.width), dtype=np.float32)
+        self.temp = np.zeros((cfg.height, cfg.width), dtype=np.float32)
 
         # economy/state
         self.shared_store: int = 0
@@ -39,18 +40,33 @@ class World:
         self.caches: Dict[Tuple[int, int], int] = {}
 
         # learning / navigation fields
-        self.road_desire = np.zeros((cfg.height, cfg.width), dtype=np.float32)  # learned preference for roads
-        self.explore     = np.zeros((cfg.height, cfg.width), dtype=np.float32)  # visitation heatmap
+        self.road_desire = np.zeros((cfg.height, cfg.width), dtype=np.float32)
+        self.explore = np.zeros((cfg.height, cfg.width), dtype=np.float32)
 
-        # dynamic structure registry
+        # dynamic structure registry:
         # code -> { name, color, cache?, move_mult?, comms_bonus?, food_boost?, iq_aura?, emit{mat->p}, emit_radius? }
         self.struct_defs: Dict[int, Dict[str, Any]] = {}
         self.next_dyn_code: int = 10
 
-        # expansion cooldown bookkeeping
+        # expansion cooldown
         self._last_expand_tick: int = -10_000
 
+        # rolling event log (e.g., builds)
+        self.events = deque(maxlen=800)
+
         self._seed_resources()
+
+    # ---------- event logging ----------
+    def log_event(self, kind: str, info: Dict[str, Any]) -> None:
+        self.events.append({"tick": self.tick, "kind": kind, **info})
+
+    def log_build(self, code: int, y: int, x: int) -> None:
+        names = {7: "Road", 8: "Cache", 9: "Beacon"}
+        if code >= 10:
+            nm = self.struct_defs.get(code, {}).get("name", f"type{code}")
+        else:
+            nm = names.get(code, f"type{code}")
+        self.log_event("build", {"code": int(code), "y": int(y), "x": int(x), "name": nm})
 
     # ---------- helpers ----------
     def _seed_resources(self) -> None:
@@ -89,7 +105,7 @@ class World:
 
         # learning/exploration fade
         self.road_desire *= 0.9995
-        self.explore     *= 0.9997
+        self.explore *= 0.9997
 
         # dynamic structure effects periodically
         if self.tick % 10 == 0:
@@ -191,6 +207,9 @@ class World:
             self.materials[y, x] = code
             if code == 8 or (code in self.struct_defs and self.struct_defs[code].get("cache", False)):
                 self.caches[(y, x)] = 0
+            # log builds for non-empty structural tiles
+            if code >= 7:
+                self.log_build(code, y, x)
             return True
         return False
 
@@ -211,7 +230,7 @@ class World:
     def place_cache(self, y: int, x: int) -> bool:  return self.place(y, x, 8)
     def place_beacon(self, y: int, x: int) -> bool: return self.place(y, x, 9)
 
-    # dynamic registry -------------------------------------------------------
+    # ---------- dynamic registry ----------
     def add_dynamic_structure_type(self, name: str, props: Dict[str, Any]) -> int:
         code = self.next_dyn_code
         self.next_dyn_code += 1
@@ -221,8 +240,9 @@ class World:
 
         def hsv_to_hex(h: float) -> str:
             i = int(h * 6) % 6
-            f = h * 6 - int(h * 6); q = 1 - f
-            rgb = [(1, f, 0),(q,1,0),(0,1,f),(0,q,1),(f,0,1),(1,0,q)][i]
+            f = h * 6 - int(h * 6)
+            q = 1 - f
+            rgb = [(1, f, 0), (q, 1, 0), (0, 1, f), (0, q, 1), (f, 0, 1), (1, 0, q)][i]
             r, g, b = [int(255 * (0.6 + 0.4 * v)) for v in rgb]
             return f"#{r:02x}{g:02x}{b:02x}"
 
@@ -241,7 +261,7 @@ class World:
             return self.struct_defs[code]
         return {}
 
-    # caches API
+    # ---------- caches ----------
     def cache_deposit(self, y: int, x: int, n: int) -> int:
         code = int(self.materials[y, x])
         if not self.tile_props(code).get("cache", False):
@@ -258,7 +278,7 @@ class World:
         self.caches[(y, x)] = have - take
         return take
 
-    # learning hooks
+    # ---------- learning hooks ----------
     def reinforce_path(self, path, amount: float = 1.0) -> None:
         if not path:
             return
@@ -266,11 +286,10 @@ class World:
             if 0 <= y < self.cfg.height and 0 <= x < self.cfg.width:
                 self.road_desire[y, x] = min(self.road_desire[y, x] + amount, 50.0)
 
-    # exploration marking
     def mark_visit(self, y: int, x: int, amount: float = 1.0) -> None:
         self.explore[y, x] = min(self.explore[y, x] + amount, 100.0)
 
-    # comms / learning auras
+    # ---------- comms / learning auras ----------
     def comm_bonus_at(self, y: int, x: int) -> int:
         r = 2
         y0, y1 = max(0, y - r), min(self.cfg.height, y + r + 1)
@@ -349,11 +368,11 @@ class World:
             return 0
 
         # grow arrays
-        self.materials   = np.pad(self.materials,   ((pad_use, pad_use), (pad_use, pad_use)), mode="constant")
-        self.energy      = np.pad(self.energy,      ((pad_use, pad_use), (pad_use, pad_use)), mode="constant")
-        self.temp        = np.pad(self.temp,        ((pad_use, pad_use), (pad_use, pad_use)), mode="constant")
+        self.materials = np.pad(self.materials, ((pad_use, pad_use), (pad_use, pad_use)), mode="constant")
+        self.energy = np.pad(self.energy, ((pad_use, pad_use), (pad_use, pad_use)), mode="constant")
+        self.temp = np.pad(self.temp, ((pad_use, pad_use), (pad_use, pad_use)), mode="constant")
         self.road_desire = np.pad(self.road_desire, ((pad_use, pad_use), (pad_use, pad_use)), mode="constant")
-        self.explore     = np.pad(self.explore,     ((pad_use, pad_use), (pad_use, pad_use)), mode="constant")
+        self.explore = np.pad(self.explore, ((pad_use, pad_use), (pad_use, pad_use)), mode="constant")
 
         # shift caches & pantry
         self.caches = {(y + pad_use, x + pad_use): v for (y, x), v in self.caches.items()}
