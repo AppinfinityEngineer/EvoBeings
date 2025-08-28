@@ -1,11 +1,11 @@
 """
-Agents with age-based intelligence, exploration drive, and wander missions.
+Agents with age-based intelligence, exploration drive, wander missions, and
+runtime innovation that can name structures and bootstrap resources.
 
-Key additions:
-- Explore the map by minimizing world.explore (novelty seeking).
-- If they get "bored" near home (no deposits for a while), they pick a far,
-  low-explore target and head there (wander mission).
-- Still auto-harvest after move, learn roads, build roads, innovate, etc.
+New:
+- Per-tick intelligence also gets boosted by nearby structures with iq_aura.
+- Innovation can add emit (wood/fiber/stone/food) and iq_aura.
+- Names are descriptive: e.g., "Relay Depot Grove", "Quarry Waystation", "Farm Workshop".
 """
 from dataclasses import dataclass, field
 from typing import Tuple, Dict, Any, Set, List, Optional
@@ -21,9 +21,9 @@ INNOVATE_IQ = 0.8
 INNOVATE_PROB = 0.02
 
 # exploration / boredom
-BORED_TICKS = 160            # ~8–10 seconds at ~18 fps
-LONG_NO_DEPOSIT = 400        # fallback trigger for wander
-WANDER_LIFE = 700            # how long a wander mission lasts
+BORED_TICKS = 160
+LONG_NO_DEPOSIT = 400
+WANDER_LIFE = 700
 
 
 @dataclass
@@ -56,7 +56,8 @@ class Agent:
         if inbox is None: inbox = []
         self.last_inbox_n = len(inbox)
         self.age += 1
-        self.intelligence = min(2.0, self.intelligence + 0.0007)
+        # base growth + aura boost from nearby structures
+        self.intelligence = min(2.0, self.intelligence + 0.0007 + world.iq_aura_at(*self.pos))
         self.ticks_since_deposit += 1
 
         # boredom logic (only when not carrying)
@@ -80,26 +81,20 @@ class Agent:
     # ---------------------------------------------------------------------
 
     def _choose_wander_target(self, world: World) -> None:
-        """Pick a far, low-explore cell and set a mission to go there."""
         H, W = world.cfg.height, world.cfg.width
-        if world.pantry:
-            py, px = world.pantry
-        else:
-            py, px = self.pos
+        py, px = world.pantry if world.pantry else self.pos
 
-        # sample candidates in an outer annulus
         cand: List[Tuple[int, int, float]] = []
         for _ in range(400):
             y = int(np.random.randint(0, H))
             x = int(np.random.randint(0, W))
             d = abs(y - py) + abs(x - px)
-            if d < max(6, (H+W)//8):   # prefer far-ish
+            if d < max(6, (H+W)//8):
                 continue
             cand.append((y, x, float(world.explore[y, x])))
 
         if not cand:
             return
-        # choose the least-explored among the 20% best
         cand.sort(key=lambda t: t[2])
         pick = cand[: max(1, len(cand)//5)]
         y, x, _ = pick[int(np.random.randint(0, len(pick)))]
@@ -132,37 +127,30 @@ class Agent:
             ny, nx = world.in_bounds(ay + dy, ax + dx)
             tile_next = int(world.materials[ny, nx])
 
-            # penalize no-op (clipped)
             if ny == ay and nx == ax:
-                return -1e6
+                return -1e6  # avoid no-op
 
-            # pantry distance terms
             d_now = dist_home
             d_next = abs((world.pantry[0] if world.pantry else ay) - ny) + \
                      abs((world.pantry[1] if world.pantry else ax) - nx)
             toward_home = float(d_now - d_next)
 
-            # road / dynamic mover bonus
             has_move = 1.0 if (tile_next == 7 or "move_mult" in world.tile_props(tile_next)) else 0.0
             road_bonus = self.road_bias * has_move
 
-            # exploration: prefer *lower* world.explore
             exp_here = world.explore[ny, nx]
-            explore_gain = -float(exp_here) * 0.02  # negative -> prefers novel
+            explore_gain = -float(exp_here) * 0.02  # prefer lower explore
 
-            # edge inward
             next_edge = edge_dist(ny, nx)
             edge_inward = max(0.0, next_edge - curr_edge)
 
-            # wander mission attraction (only when not carrying)
             to_target = 0.0
             if not carrying and self.wander_target is not None:
                 ty, tx = self.wander_target
                 d_now_t = abs(ay - ty) + abs(ax - tx)
                 d_next_t = abs(ny - ty) + abs(nx - tx)
-                to_target = float(d_now_t - d_next_t)  # positive if closer
+                to_target = float(d_now_t - d_next_t)
 
-            # novelty
             novelty = 1.0 if (ny, nx) not in self.visited else 0.0
             jitter = (np.random.rand() - 0.5) * 0.02
 
@@ -171,7 +159,6 @@ class Agent:
                        + 1.0 * road_bonus + 0.10 * edge_inward + 0.02 * novelty + jitter
             else:
                 outward = -toward_home if dist_home <= HOME_R else 0.0
-                # prefer visible non-food resources; food secondary
                 ys_f, xs_f = np.where(mats == 1)
                 ys_w, xs_w = np.where((mats == 4) | (mats == 5) | (mats == 6))
                 toward_food = 0.0; toward_other = 0.0
@@ -189,7 +176,7 @@ class Agent:
 
         dy, dx = max(moves, key=lambda mv: score_move(*mv))
 
-        # semantic message (as before)
+        # semantic message
         local_food = float((mats == 1).mean())
         dist_norm = min(1.0, (dist_home if world.pantry else 10) / 10.0)
         msg = np.array([
@@ -224,13 +211,12 @@ class Agent:
                     before = self.inventory["food"]; self.inventory["food"] += gained
                     just_picked_food = (before == 0)
                     self.energy = min(self.energy + (0.5 + 0.1 * self.tool_level), 5.0)
-                elif code_here == 4: self.inventory["wood"] += gained
+                elif code_here == 4: self.inventory["wood"]  += gained
                 elif code_here == 5: self.inventory["fiber"] += gained
                 elif code_here == 6: self.inventory["stone"] += gained
 
         if just_picked_food:
             self.carry_path = [self.pos]
-            # pause current wander when we find food
             self.wander_target = None
         elif self.inventory["food"] > 0:
             self.carry_path.append(self.pos)
@@ -256,7 +242,7 @@ class Agent:
                     self.knowledge["roads_built"] += 1
                     self.intelligence = min(2.0, self.intelligence + 0.01)
 
-        # cache interaction (base or dynamic cache tiles)
+        # cache interaction (base or dynamic)
         props = world.tile_props(int(world.materials[y, x]))
         if props.get("cache", False):
             if self.inventory["food"] > 0:
@@ -306,20 +292,56 @@ class Agent:
         dist_home = abs(py - y) + abs(px - x)
 
         props: Dict[str, Any] = {}
-        name_bits = []
+        name_parts = []
 
+        # mobility far from home
         if dist_home >= 6 and (have_stone or have_wood):
-            props["move_mult"] = 0.7 if have_stone else 0.8; name_bits.append("way")
-        if np.random.rand() < 0.4 and have_fiber:
-            props["comms_bonus"] = int(2 + np.random.randint(0, 3)); name_bits.append("signal")
-        if np.random.rand() < 0.5 and have_wood:
-            props["cache"] = True; name_bits.append("cache")
-        if np.random.rand() < 0.25:
-            props["food_boost"] = round(0.1 + 0.3 * np.random.rand(), 2); name_bits.append("grove")
-        if not props:
-            props["move_mult"] = 0.85; name_bits.append("mark")
+            props["move_mult"] = 0.7 if have_stone else 0.8
+            name_parts.append("Waystation")
 
-        name = "-".join(name_bits) if name_bits else "node"
+        # comms hub
+        if np.random.rand() < 0.45 and have_fiber:
+            props["comms_bonus"] = int(2 + np.random.randint(0, 3))  # 2..4
+            name_parts.append("Relay")
+
+        # depot/cache
+        if np.random.rand() < 0.55 and have_wood:
+            props["cache"] = True
+            name_parts.append("Depot")
+
+        # food growth
+        if np.random.rand() < 0.30:
+            props["food_boost"] = round(0.1 + 0.3 * np.random.rand(), 2)
+            name_parts.append("Grove")
+
+        # resource emit (elders can bootstrap resources)
+        if self.intelligence > 1.1 and np.random.rand() < 0.5:
+            emit: Dict[int, float] = {}
+            # pick 1–2 kinds to emit
+            kinds = [4, 5, 6, 1]  # wood, fiber, stone, food
+            self_rng = np.random.choice(kinds, size=int(1 + np.random.randint(0, 2)), replace=False)
+            for k in self_rng:
+                emit[int(k)] = round(0.10 + 0.20 * np.random.rand(), 2)  # per-attempt probability
+                # add a name part
+                if k == 4: name_parts.append("Forester")
+                if k == 5: name_parts.append("Loom")
+                if k == 6: name_parts.append("Quarry")
+                if k == 1: name_parts.append("Farm")
+            props["emit"] = emit
+            props["emit_radius"] = 1
+
+        # iq aura: make nearby workers learn faster
+        if self.intelligence > 1.0 and np.random.rand() < 0.4:
+            props["iq_aura"] = round(0.001 + 0.003 * np.random.rand(), 4)
+            name_parts.append("Workshop")
+
+        if not props:
+            props["move_mult"] = 0.85
+            name_parts.append("Marker")
+
+        # final name
+        name = " ".join(name_parts) if name_parts else "Node"
+
         code = world.add_dynamic_structure_type(name=name, props=props)
         if world.place(y, x, code):
             if props.get("cache"): self.inventory["wood"] = max(0, self.inventory["wood"] - 3)

@@ -1,19 +1,22 @@
 """
 Viewer (infinite run) with:
-- pantry protection + auto-repair (press 'P' to restore)
-- adaptive growth, batch reproduction, dynamic structure colors
-- chatter HUD (based on semantic messages)
+- adaptive growth & doubling reproduction
+- pantry protection/auto-repair (press 'P' to restore)
+- dynamic structure legend (press 'L' to toggle)
+- HUD includes average agent intelligence again
+
 Controls:
-  1=Seed  2=Tree  3=Fiber  4=Rock  5=Road  6=Cache  7=Beacon  0=Eraser  P=Restore pantry
+  1=Seed  2=Tree  3=Fiber  4=Rock  5=Road  6=Cache  7=Beacon  0=Eraser
+  P=Restore pantry   L=Toggle legend
 """
 import time
 from typing import List
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import colors
-
 from .world import World, WorldConfig
 from .agents import Agent
+from matplotlib.ticker import NullLocator  
 
 COST_PER_NEW = 10
 CROWD_CAP = 6
@@ -61,23 +64,40 @@ def run_live_multi(
 
     cmap, norm = _make_cmap(world)
     fig, ax = plt.subplots(figsize=(width / 8, height / 8))
-    try: fig.canvas.manager.set_window_title("Evo Beings — Live Multi (Pantry-Protected Comms)")
+    try: fig.canvas.manager.set_window_title("Evo Beings — Live Multi (Innovation & Learning)")
     except Exception: pass
 
-    img = ax.imshow(world.materials * 1, cmap=cmap, norm=norm, interpolation="nearest")
+    ax.set_xscale("linear")
+    ax.set_yscale("linear")
+    ax.set_xlim(-0.5, width - 0.5)
+    ax.set_ylim(height - 0.5, -0.5)
+    ax.xaxis.set_major_locator(NullLocator())
+    ax.yaxis.set_major_locator(NullLocator())
+
+    img = ax.imshow(
+        world.materials * 1,
+        cmap=cmap,
+        norm=norm,
+        interpolation="nearest",
+        origin="upper", 
+    )
     colormap = plt.cm.get_cmap("tab20", max(n_agents, 20))
     agent_colors = [colormap(i % colormap.N) for i in range(n_agents)]
     ys = [a.pos[0] for a in agents]; xs = [a.pos[1] for a in agents]
     scat = ax.scatter(xs, ys, s=50, c=agent_colors)
 
     hud = ax.text(2, 1, "", color="white", fontsize=8)
+    legend_text = ax.text(width - 1, 1, "", color="white", fontsize=7,
+                          ha="right", va="top", family="monospace")
+    legend_on = True
+
     ax.set_xticks([]); ax.set_yticks([])
     plt.tight_layout(); plt.pause(0.001)
 
     current_brush = 2  # seed
 
     def on_key(ev):
-        nonlocal current_brush
+        nonlocal current_brush, legend_on
         if ev.key == "1": current_brush = 2
         elif ev.key == "2": current_brush = 4
         elif ev.key == "3": current_brush = 5
@@ -87,7 +107,9 @@ def run_live_multi(
         elif ev.key == "7": current_brush = 9
         elif ev.key == "0": current_brush = 0
         elif ev.key in ("p", "P"):
-            world.ensure_pantry(base_y, base_x)  # manual restore
+            world.ensure_pantry(base_y, base_x)
+        elif ev.key in ("l", "L"):
+            legend_on = not legend_on
 
     def on_click(ev):
         if ev.inaxes is not ax or ev.xdata is None or ev.ydata is None:
@@ -109,10 +131,10 @@ def run_live_multi(
     fig.canvas.mpl_connect("button_press_event", on_click)
 
     delay = 1.0 / max(1, fps)
-    grow_every = max(1, int(2 * fps))
+    grow_every = max(1, int(2 * fps))  # ~2 seconds
 
     while plt.fignum_exists(fig.number):
-        # auto-repair pantry if missing (prevents softlock)
+        # ensure pantry present
         if world.pantry is None or world.materials[base_y, base_x] != 3:
             world.ensure_pantry(base_y, base_x)
 
@@ -152,7 +174,7 @@ def run_live_multi(
                 break
             doubled += 1
 
-        # refresh colormap if new dyn types appeared
+        # refresh cmap if new dynamic types appeared
         cmap, norm = _make_cmap(world)
         img.set_cmap(cmap); img.set_norm(norm)
         img.set_data(world.materials * 1)
@@ -160,11 +182,31 @@ def run_live_multi(
         ys = [a.pos[0] for a in agents]; xs = [a.pos[1] for a in agents]
         scat.set_offsets(np.c_[xs, ys]); scat.set_color(agent_colors)
 
-        # chatter metric: count of message components > 0.6
-        chatter = sum((getattr(a, "last_msg", np.zeros(4)) > 0.6).sum() for a in agents)
+        # HUD: avg intelligence back on screen
+        mean_iq = np.mean([a.intelligence for a in agents]) if agents else 0.0
         hud.set_text(
-            f"tick {world.tick} | agents {len(agents)} | store {world.shared_store} | doubled x{doubled} | dynTypes {len(world.struct_defs)} | chatter {int(chatter)} | brush {current_brush}"
+            f"tick {world.tick} | agents {len(agents)} | store {world.shared_store} | doubled x{doubled} | dynTypes {len(world.struct_defs)} | avgIQ {mean_iq:.2f} | brush {current_brush}"
         )
+
+        # Legend: invented types with names
+        if legend_on:
+            lines = ["[structures]"]
+            if world.struct_defs:
+                for code, props in sorted(world.struct_defs.items()):
+                    nm = props.get("name", f"type{code}")
+                    parts = []
+                    if "move_mult" in props: parts.append("move")
+                    if props.get("cache"):  parts.append("cache")
+                    if "comms_bonus" in props: parts.append(f"comms+{props['comms_bonus']}")
+                    if "food_boost" in props: parts.append(f"food+{props['food_boost']}")
+                    if "iq_aura" in props: parts.append(f"iq+{props['iq_aura']}")
+                    if "emit" in props: parts.append("emit")
+                    lines.append(f"{code}: {nm} ({', '.join(parts)})")
+            else:
+                lines.append("(none yet)")
+            legend_text.set_text("\n".join(lines))
+        else:
+            legend_text.set_text("")
 
         plt.pause(0.001); time.sleep(delay)
 
