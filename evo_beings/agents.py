@@ -1,11 +1,8 @@
 """
-Agents with age-based intelligence, exploration drive, wander missions, and
-runtime innovation that can name structures and bootstrap resources.
+Agents with age-based intelligence, exploration drive, wander missions, chatter,
+and runtime innovation that can name structures and bootstrap resources.
 
-New:
-- Per-tick intelligence also gets boosted by nearby structures with iq_aura.
-- Innovation can add emit (wood/fiber/stone/food) and iq_aura.
-- Names are descriptive: e.g., "Relay Depot Grove", "Quarry Waystation", "Farm Workshop".
+Message vector: [carrying(0/1), local_food_density, dist_to_pantry_norm, intelligence_norm]
 """
 from dataclasses import dataclass, field
 from typing import Tuple, Dict, Any, Set, List, Optional
@@ -24,6 +21,15 @@ INNOVATE_PROB = 0.02
 BORED_TICKS = 160
 LONG_NO_DEPOSIT = 400
 WANDER_LIFE = 700
+
+SYLL = np.array(["na","ko","ri","ta","mu","lo","vi","za","ge","ra",
+                 "mi","so","tu","ka","li","do","fa","ni","sa","ru"])
+
+
+def _coin_word(seed: int, syll_min: int = 2, syll_max: int = 3) -> str:
+    rng = np.random.default_rng(seed)
+    k = int(rng.integers(syll_min, syll_max + 1))
+    return "".join(rng.choice(SYLL, size=k))
 
 
 @dataclass
@@ -46,17 +52,23 @@ class Agent:
     })
     last_inbox_n: int = 0
 
-    # exploration state
+    # exploration / comms / style
     bored_counter: int = 0
     ticks_since_deposit: int = 0
     wander_target: Optional[Tuple[int, int]] = None
     wander_until: int = 0
+    gene: int = field(default_factory=lambda: int(np.random.randint(1, 2**31)))
+
+    # public “word” for chatter
+    @property
+    def call_sign(self) -> str:
+        return _coin_word(self.gene)
 
     def act(self, world: World, inbox: List[np.ndarray] = None) -> Dict[str, Any]:
         if inbox is None: inbox = []
         self.last_inbox_n = len(inbox)
         self.age += 1
-        # base growth + aura boost from nearby structures
+        # base growth + local aura
         self.intelligence = min(2.0, self.intelligence + 0.0007 + world.iq_aura_at(*self.pos))
         self.ticks_since_deposit += 1
 
@@ -86,17 +98,15 @@ class Agent:
 
         cand: List[Tuple[int, int, float]] = []
         for _ in range(400):
-            y = int(np.random.randint(0, H))
-            x = int(np.random.randint(0, W))
+            y = int(np.random.randint(0, H)); x = int(np.random.randint(0, W))
             d = abs(y - py) + abs(x - px)
-            if d < max(6, (H+W)//8):
+            if d < max(6, (H + W) // 8):
                 continue
             cand.append((y, x, float(world.explore[y, x])))
 
-        if not cand:
-            return
+        if not cand: return
         cand.sort(key=lambda t: t[2])
-        pick = cand[: max(1, len(cand)//5)]
+        pick = cand[: max(1, len(cand) // 5)]
         y, x, _ = pick[int(np.random.randint(0, len(pick)))]
         self.wander_target = (y, x)
         self.wander_until = world.tick + WANDER_LIFE
@@ -176,7 +186,7 @@ class Agent:
 
         dy, dx = max(moves, key=lambda mv: score_move(*mv))
 
-        # semantic message
+        # semantic message (drives chatter)
         local_food = float((mats == 1).mean())
         dist_norm = min(1.0, (dist_home if world.pantry else 10) / 10.0)
         msg = np.array([
@@ -292,57 +302,59 @@ class Agent:
         dist_home = abs(py - y) + abs(px - x)
 
         props: Dict[str, Any] = {}
-        name_parts = []
+        name_bits = []
+
+        # homes / depots / schools emerge with higher intelligence
+        if self.intelligence > 1.2 and np.random.rand() < 0.35:
+            props["cache"] = True
+            props["iq_aura"] = props.get("iq_aura", 0.0) + 0.002
+            name_bits.append("Home")
+
+        if self.intelligence > 1.4 and np.random.rand() < 0.3:
+            props["iq_aura"] = props.get("iq_aura", 0.0) + 0.004
+            name_bits.append("School")
 
         # mobility far from home
         if dist_home >= 6 and (have_stone or have_wood):
             props["move_mult"] = 0.7 if have_stone else 0.8
-            name_parts.append("Waystation")
+            name_bits.append("Waystation")
 
         # comms hub
         if np.random.rand() < 0.45 and have_fiber:
             props["comms_bonus"] = int(2 + np.random.randint(0, 3))  # 2..4
-            name_parts.append("Relay")
+            name_bits.append("Relay")
 
         # depot/cache
         if np.random.rand() < 0.55 and have_wood:
             props["cache"] = True
-            name_parts.append("Depot")
+            name_bits.append("Depot")
 
         # food growth
         if np.random.rand() < 0.30:
             props["food_boost"] = round(0.1 + 0.3 * np.random.rand(), 2)
-            name_parts.append("Grove")
+            name_bits.append("Grove")
 
         # resource emit (elders can bootstrap resources)
         if self.intelligence > 1.1 and np.random.rand() < 0.5:
             emit: Dict[int, float] = {}
-            # pick 1–2 kinds to emit
             kinds = [4, 5, 6, 1]  # wood, fiber, stone, food
-            self_rng = np.random.choice(kinds, size=int(1 + np.random.randint(0, 2)), replace=False)
-            for k in self_rng:
-                emit[int(k)] = round(0.10 + 0.20 * np.random.rand(), 2)  # per-attempt probability
-                # add a name part
-                if k == 4: name_parts.append("Forester")
-                if k == 5: name_parts.append("Loom")
-                if k == 6: name_parts.append("Quarry")
-                if k == 1: name_parts.append("Farm")
+            for k in np.random.choice(kinds, size=int(1 + np.random.randint(0, 2)), replace=False):
+                emit[int(k)] = round(0.06 + 0.16 * np.random.rand(), 2)
+                if k == 4: name_bits.append("Forester")
+                if k == 5: name_bits.append("Loom")
+                if k == 6: name_bits.append("Quarry")
+                if k == 1: name_bits.append("Farm")
             props["emit"] = emit
             props["emit_radius"] = 1
 
-        # iq aura: make nearby workers learn faster
-        if self.intelligence > 1.0 and np.random.rand() < 0.4:
-            props["iq_aura"] = round(0.001 + 0.003 * np.random.rand(), 4)
-            name_parts.append("Workshop")
-
         if not props:
             props["move_mult"] = 0.85
-            name_parts.append("Marker")
+            name_bits.append("Marker")
 
-        # final name
-        name = " ".join(name_parts) if name_parts else "Node"
+        # agent-chosen name with a small coined suffix for style
+        name = " ".join(name_bits) + " " + self.call_sign
 
-        code = world.add_dynamic_structure_type(name=name, props=props)
+        code = world.add_dynamic_structure_type(name=name.strip(), props=props)
         if world.place(y, x, code):
             if props.get("cache"): self.inventory["wood"] = max(0, self.inventory["wood"] - 3)
             if "comms_bonus" in props: self.inventory["fiber"] = max(0, self.inventory["fiber"] - 2)
