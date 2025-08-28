@@ -1,9 +1,18 @@
 """
 Viewer (infinite run) with:
 - adaptive growth & doubling reproduction
-- pantry protection/auto-repair (P), legend toggle (L), chatter toggle (C), labels toggle (B)
+- pantry auto-restore (P)
 - HUD: agents, store, dynTypes, avgIQ, chatter, brush
-- Camera: WASD/arrows/middle-drag pan, +/- or wheel zoom, follow centroid (F), home (H)
+- Camera: WASD/arrows/middle-drag pan, +/- or wheel zoom, follow centroid (F), Home (H)
+- On-map structure labels toggle (B)  [OFF by default to keep screen clean]
+- NEW: compact "Structure Feed" under HUD showing most recent builds, scrollable
+- NEW: agent ranks (1..100) instead of names (toggle R)
+
+Feed controls:
+  J = toggle feed,  [ and ] = scroll feed (recent back/forward)
+
+Other controls:
+  1..7/8/9/0 = brushes  |  L = legend toggle  |  C = chatter tags toggle
 """
 import time
 from typing import List
@@ -11,6 +20,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import colors
 from matplotlib.ticker import NullLocator
+from matplotlib.patches import Rectangle
 
 from .world import World, WorldConfig
 from .agents import Agent
@@ -22,7 +32,10 @@ CROWD_CAP = 6
 HUD_PERIOD     = 2
 LEGEND_PERIOD  = 12
 LABEL_PERIOD   = 12
-MAX_LABELS     = 20
+MAX_LABELS     = 16
+
+# Feed settings
+FEED_LINES = 8
 
 def _make_cmap(world: World):
     base = [
@@ -63,7 +76,6 @@ def run_live_multi(
                 taken.add(pos); break
         agents.append(Agent(pos=pos))
 
-    # --- viewer "one screen" pad (per side) ---
     PAD_ONE_SCREEN = max(8, min(width, height) // 2)
 
     cmap, norm = _make_cmap(world)
@@ -78,19 +90,31 @@ def run_live_multi(
     img = ax.imshow(world.materials * 1, cmap=cmap, norm=norm,
                     interpolation="nearest", origin="upper")
     H0, W0 = world.materials.shape
-    img.set_extent((-0.5, W0 - 0.5, H0 - 0.5, -0.5))
+    img.set_extent((-0.5, W0 - 0.5, H0 - 0.5, -0.5))  # sync bounds
 
     colormap = plt.cm.get_cmap("tab20", max(n_agents, 20))
     agent_colors = [colormap(i % colormap.N) for i in range(n_agents)]
     ys = [a.pos[0] for a in agents]; xs = [a.pos[1] for a in agents]
     scat = ax.scatter(xs, ys, s=50, c=agent_colors)
 
+    # HUD + legend
     hud = ax.text(2, 1, "", color="white", fontsize=8)
     legend_text = ax.text(width - 1, 1, "", color="white", fontsize=7,
                           ha="right", va="top", family="monospace")
-    legend_on = True
+    legend_on = False                 # OFF by default (clean screen)
     show_chatter = True
-    show_build_labels = True
+    show_build_labels = False         # OFF by default
+
+    # NEW: Structure Feed under HUD
+    feed_on = True
+    feed_offset = 0
+    feed_bg = Rectangle((0, 0), 1, 1, facecolor="black", alpha=0.35, zorder=2, visible=False)
+    ax.add_patch(feed_bg)
+    feed_text = ax.text(0, 0, "", color="white", fontsize=7, family="monospace",
+                        ha="left", va="top", zorder=3)
+
+    # Ranks toggle
+    show_ranks = True
 
     # camera state
     cam_x, cam_y = float(base_x), float(base_y)
@@ -102,6 +126,7 @@ def run_live_multi(
     drag_start_cam = (0.0, 0.0)
     last_dyn_count = len(world.struct_defs)
 
+    # -------- camera helpers --------
     def set_view():
         H, W = world.materials.shape
         vw = max(4.0, width / max(1e-6, zoom))
@@ -123,6 +148,7 @@ def run_live_multi(
     ax.set_xticks([]); ax.set_yticks([])
     plt.tight_layout(); plt.pause(0.001)
 
+    # -------- interaction --------
     current_brush = 2
 
     def _home_camera():
@@ -131,7 +157,8 @@ def run_live_multi(
         cam_x, cam_y, zoom, follow = float(px), float(py), 1.0, False
 
     def on_key(ev):
-        nonlocal current_brush, legend_on, show_chatter, zoom, cam_x, cam_y, follow, show_build_labels
+        nonlocal current_brush, legend_on, show_chatter, zoom, cam_x, cam_y, follow
+        nonlocal show_build_labels, feed_on, feed_offset, show_ranks
         step = 5.0 / max(1.0, zoom)
         if ev.key == "1": current_brush = 2
         elif ev.key == "2": current_brush = 4
@@ -145,6 +172,10 @@ def run_live_multi(
         elif ev.key in ("l", "L"): legend_on = not legend_on
         elif ev.key in ("c", "C"): show_chatter = not show_chatter
         elif ev.key in ("b", "B"): show_build_labels = not show_build_labels
+        elif ev.key in ("r", "R"): show_ranks = not show_ranks
+        elif ev.key in ("j", "J"): feed_on = not feed_on
+        elif ev.key == "[": feed_offset = max(0, feed_offset - 1)
+        elif ev.key == "]": feed_offset += 1
         elif ev.key in ("f", "F"): follow = not follow
         elif ev.key in ("h", "H", "home"): _home_camera()
         elif ev.key in ("+", "="): zoom = min(6.0, zoom * 1.2)
@@ -196,28 +227,45 @@ def run_live_multi(
 
     delay = 1.0 / max(1, fps)
     grow_every = max(1, int(2 * fps))
-
     label_artists: List = []
+    rank_artists: List = []
+
+    # ------- local rank heuristic (age + IQ + social proximity) -------
+    def compute_rank(a: Agent) -> int:
+        a._age = getattr(a, "_age", 0) + 1
+        a._soc = getattr(a, "_soc", 0.0)
+        iq = float(getattr(a, "intelligence", 0.0))
+        score = 50.0 * iq + 0.6 * a._age + 10.0 * a._soc
+        # squash to 1..100
+        return int(np.clip(100.0 * np.tanh(score / 120.0), 1, 100))
 
     while plt.fignum_exists(fig.number):
         if world.pantry is None or world.materials[base_y, base_x] != 3:
             world.ensure_pantry(base_y, base_x)
 
-        # expand by ONE SCREEN per event (viewer-sized), world throttles internally
+        # one-screen expansion (world throttles internally)
         pad = world.expand_if_needed(agents, margin=8, pad=PAD_ONE_SCREEN)
         if pad > 0:
             cam_x += pad; cam_y += pad
             H, W = world.materials.shape
-            img.set_extent((-0.5, W - 0.5, H - 0.5, -0.5))
+            img.set_extent((-0.5, W - 0.5, H - 0.5, -0.5))  # resync bounds
 
-        # agents act
+        # social proximity accumulation for ranks
+        for i, a in enumerate(agents):
+            n = 0
+            for j, b in enumerate(agents):
+                if j == i: continue
+                if abs(b.pos[0] - a.pos[0]) + abs(b.pos[1] - a.pos[1]) <= 3:
+                    n += 1
+            a._soc = getattr(a, "_soc", 0.0) + 0.01 * n
+
+        # act
         for i, a in enumerate(agents):
             inbox = world.neighbor_messages(agents, i, radius=comm_radius)
             a.act(world, inbox)
-
         world.step()
 
-        # adaptive food near pantry
+        # adaptive food
         if world.tick % grow_every == 0:
             py, px = world.pantry
             near = sum(1 for a in agents if abs(a.pos[0]-py)+abs(a.pos[1]-px) <= 4)
@@ -268,7 +316,7 @@ def run_live_multi(
         # HUD (throttled)
         if world.tick % HUD_PERIOD == 0:
             chatter = sum((getattr(a, "last_msg", np.zeros(4)) > 0.6).sum() for a in agents)
-            mean_iq = np.mean([a.intelligence for a in agents]) if agents else 0.0
+            mean_iq = np.mean([getattr(a, "intelligence", 0.0) for a in agents]) if agents else 0.0
             hud.set_position((cx - half_w + 2, cy - half_h + 1))
             hud.set_text(
                 f"tick {world.tick} | agents {len(agents)} | store {world.shared_store} | doubled x{doubled} "
@@ -283,12 +331,12 @@ def run_live_multi(
                 for code, props in sorted(world.struct_defs.items()):
                     nm = props.get("name", f"type{code}")
                     parts = []
-                    if "move_mult" in props: parts.append("move")
-                    if props.get("cache"):  parts.append("cache")
+                    if "move_mult"  in props: parts.append("move")
+                    if props.get("cache"):     parts.append("cache")
                     if "comms_bonus" in props: parts.append(f"comms+{props['comms_bonus']}")
-                    if "food_boost" in props: parts.append(f"food+{props['food_boost']}")
-                    if "iq_aura" in props: parts.append(f"iq+{props['iq_aura']}")
-                    if "emit" in props: parts.append("emit")
+                    if "food_boost"  in props: parts.append(f"food+{props['food_boost']}")
+                    if "iq_aura"     in props: parts.append(f"iq+{props['iq_aura']}")
+                    if "emit"        in props: parts.append("emit")
                     lines.append(f"{code}: {nm} ({', '.join(parts)})")
             else:
                 lines.append("(none yet)")
@@ -296,7 +344,7 @@ def run_live_multi(
         elif not legend_on:
             legend_text.set_text("")
 
-        # Labels (throttled)
+        # On-map structure labels (throttled, optional, sampled)
         if world.tick % LABEL_PERIOD == 0:
             for art in label_artists:
                 try: art.remove()
@@ -316,11 +364,47 @@ def run_live_multi(
                     nm = world.struct_defs.get(code, {}).get("name", f"type{code}")
                     label_artists.append(ax.text(xx + 0.2, yy - 0.2, nm, color="white", fontsize=6))
 
-            if show_chatter and agents:
-                step = max(1, len(agents) // 30)
-                for a in agents[::step]:
-                    label_artists.append(ax.text(a.pos[1] + 0.3, a.pos[0] - 0.3, a.call_sign,
-                                                 color="w", fontsize=6, alpha=0.7))
+        # Ranks (little "rNN" tags), sampled to avoid clutter
+        for art in rank_artists:
+            try: art.remove()
+            except Exception: pass
+        rank_artists.clear()
+        if show_ranks and agents:
+            step = max(1, len(agents) // 40)
+            for a in agents[::step]:
+                r = compute_rank(a)
+                rank_artists.append(ax.text(a.pos[1] + 0.25, a.pos[0] - 0.25, f"r{r}",
+                                            color="w", fontsize=6, alpha=0.85))
+
+        # ---- Structure Feed (compact, scrollable) ----
+        if feed_on:
+            # gather last FEED_LINES, apply scroll offset
+            evs = [e for e in list(world.events) if e.get("kind") == "build"]
+            n = len(evs)
+            start = max(0, n - FEED_LINES - feed_offset)
+            end   = max(0, n - feed_offset)
+            view = evs[start:end]
+
+            lines = [f"{e['tick']:>5}  {e.get('name','?')}" for e in view]
+            text = "[recent builds]\n" + ("\n".join(lines) if lines else "(none yet)")
+            feed_text.set_text(text)
+
+            # position feed just under HUD, with background box matching text bbox
+            feed_text.set_position((cx - half_w + 2, cy - half_h + 10))
+            # need a draw to get bbox; use renderer from canvas
+            fig.canvas.draw_idle()
+            bbox = feed_text.get_window_extent(renderer=fig.canvas.get_renderer())
+            inv = ax.transData.inverted()
+            (x0, y0) = inv.transform((bbox.x0, bbox.y1))  # top-left in data coords
+            (x1, y1) = inv.transform((bbox.x1, bbox.y0))  # bottom-right in data coords
+            pad_x = 0.4; pad_y = 0.4
+            feed_bg.set_xy((x0 - pad_x, y0 - pad_y))
+            feed_bg.set_width((x1 - x0) + 2 * pad_x)
+            feed_bg.set_height((y1 - y0) + 2 * pad_y)
+            feed_bg.set_visible(True)
+        else:
+            feed_text.set_text("")
+            feed_bg.set_visible(False)
 
         plt.pause(0.001); time.sleep(delay)
 
